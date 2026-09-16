@@ -1,0 +1,39 @@
+# Local Python environment
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local-only material: notes, reports, experiment logs, and secrets
+agent_notes/
+.local/
+.private/
+GLM-APIKEY.txt
+.env
+.env.*
+!.env.example
+
+# Upstream mirrors and generated packages
+vendor/
+dist/
+*.zip
+
+# Runtime outputs
+log/
+memory/
+*.log
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local AI assistant metadata
+.agents/
+.codex/
+.claude/
+.cursor/
+AGENTS.md
+CLAUDE.md

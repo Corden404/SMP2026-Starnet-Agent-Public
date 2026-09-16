@@ -1,0 +1,24 @@
+{
+  "global_setting": {
+    "max_budget": 60.0,
+    "max_api_calls": 50
+  },
+  "original_total": -20.0,
+  "nodes": [
+    {"id": 1, "w": 10.0, "persona": "和平", "r": 1.5, "comm_left": 3},
+    {"id": 2, "w": -40.0, "persona": "暴力", "r": 0.2, "comm_left": 3},
+    {"id": 3, "w": 0.0, "persona": "中立", "r": 1.0, "comm_left": 3},
+    {"id": 4, "w": 15.0, "persona": "和平", "r": 1.2, "comm_left": 3}
+  ],
+  "edges": [
+    [1, 2], 
+    [2, 3], 
+    [3, 4], 
+    [1, 4]
+  ],
+  "prompts": {
+    "1": 15.0,  
+    "2": 10.0,
+    "3": -5.0
+  }
+}
