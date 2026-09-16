@@ -1,38 +1,80 @@
+import math
+
 import requests
 
+
 class RemoteStarNetEnv:
-    def __init__(self, api_url, custom_seed_data=None):
-        self.api_url = api_url
-        # 允许选手在本地传入他们自己捏的测试种子，发送给服务器初始化沙盒
-        response = requests.post(f"{self.api_url}/api/start_session", json={"seed": custom_seed_data})
-        if response.status_code == 200:
-            self.session_id = response.json()["session_id"]
-        else:
-            raise Exception("无法连接到官方测试 API，或种子格式错误！")
+    """Thin HTTP adapter for the public sandbox environment API."""
+
+    def __init__(self, api_url, custom_seed_data=None, timeout=15.0):
+        self.api_url = api_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        response = self._post("/api/start_session", {"seed": custom_seed_data})
+        self.session_id = self._required(response, "session_id", "/api/start_session")
+        if not isinstance(self.session_id, str) or not self.session_id:
+            raise ValueError("Sandbox returned an invalid session_id")
+
+    def _post(self, path, payload):
+        # Environment actions are non-idempotent. Never retry here: a timeout
+        # may mean the server applied the action but the response was lost.
+        response = self.session.post(
+            f"{self.api_url}{path}",
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"Sandbox returned a non-object response for {path}")
+        return data
+
+    @staticmethod
+    def _required(data, key, path):
+        if key not in data:
+            raise ValueError(f"Sandbox response for {path} is missing {key}")
+        return data[key]
+
+    def _session_payload(self, **extra):
+        return {"session_id": self.session_id, **extra}
 
     def get_remaining_budget(self):
-        res = requests.post(f"{self.api_url}/api/get_budget", json={"session_id": self.session_id})
-        return res.json().get("budget", 0)
+        data = self._post("/api/get_budget", self._session_payload())
+        budget = self._required(data, "budget", "/api/get_budget")
+        if type(budget) not in (int, float) or not math.isfinite(budget):
+            raise ValueError("Sandbox returned an invalid budget")
+        return budget
 
     def scan_node(self, node_id: int):
-        res = requests.post(f"{self.api_url}/api/scan", json={"session_id": self.session_id, "node_id": node_id})
-        return res.json().get("data") # 如果不存在返回 None
+        data = self._post("/api/scan", self._session_payload(node_id=node_id))
+        result = self._required(data, "data", "/api/scan")
+        if result is not None and not isinstance(result, dict):
+            raise ValueError("Sandbox returned an invalid scan payload")
+        return result
 
     def communicate(self, node_id: int, prompt_id: int):
-        res = requests.post(f"{self.api_url}/api/communicate", json={
-            "session_id": self.session_id, "node_id": node_id, "prompt_id": prompt_id
-        })
-        return res.json()
+        return self._post(
+            "/api/communicate",
+            self._session_payload(node_id=node_id, prompt_id=prompt_id),
+        )
 
     def cut_link(self, u: int, v: int) -> bool:
-        res = requests.post(f"{self.api_url}/api/cut", json={"session_id": self.session_id, "u": u, "v": v})
-        return res.json().get("success", False)
+        data = self._post("/api/cut", self._session_payload(u=u, v=v))
+        success = self._required(data, "success", "/api/cut")
+        if type(success) is not bool:
+            raise ValueError("Sandbox returned an invalid cut result")
+        return success
 
     def shield_node(self, node_id: int) -> bool:
-        res = requests.post(f"{self.api_url}/api/shield", json={"session_id": self.session_id, "node_id": node_id})
-        return res.json().get("success", False)
-        
+        data = self._post("/api/shield", self._session_payload(node_id=node_id))
+        success = self._required(data, "success", "/api/shield")
+        if type(success) is not bool:
+            raise ValueError("Sandbox returned an invalid shield result")
+        return success
+
     def trigger_eval(self):
-        """让服务器进行最终推演结算"""
-        res = requests.post(f"{self.api_url}/api/evaluate", json={"session_id": self.session_id})
-        return res.json().get("final_score", 0)
+        data = self._post("/api/evaluate", self._session_payload())
+        score = self._required(data, "final_score", "/api/evaluate")
+        if type(score) not in (int, float) or not math.isfinite(score):
+            raise ValueError("Sandbox returned an invalid final_score")
+        return score

@@ -1,0 +1,7 @@
+你是{{agent.description.role}}。目标是在预算内发现高价值节点，为最终总得分决策提供图谱。
+当前预算{{extra.budget}}，总节点数{{extra.node_count}}。
+尚未扫描的合法ID：{{extra.unknown_ids}}
+已知边连接到的未扫描节点：{{extra.frontier}}
+选择接下来最多10个互不重复的扫描ID，优先从已知边界探索。只允许选择尚未扫描ID。
+每次实际扫描后都会更新图谱和检查预算，下一批重新规划。
+只输出JSON：{"targets":[1,2,3],"reason":"简短理由"}

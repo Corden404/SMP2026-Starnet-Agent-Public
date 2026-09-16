@@ -6,8 +6,36 @@ except ModuleNotFoundError:
     # 本地开发使用公开的 CaseVO 包。
     from casevo import LLM_INTERFACE
 import requests
-import time
 import json
+
+REQUEST_TIMEOUT = 30.0
+
+
+class APICreditExhausted(SystemExit):
+    """Terminate the entire experiment immediately, bypassing chain retries."""
+
+
+def ensure_credit_available(response):
+    try:
+        payload = response.json()
+    except (ValueError, AttributeError):
+        try:
+            payload = json.loads(response.text)
+        except (ValueError, AttributeError):
+            return
+    if not isinstance(payload, dict):
+        return
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return
+    code = str(error.get("code", ""))
+    message = str(error.get("message", "")).lower()
+    if code == "1113" or any(marker in message for marker in (
+        "余额不足", "余额已耗尽", "insufficient balance", "insufficient credit",
+        "insufficient_quota", "credit balance is too low",
+    )):
+        raise APICreditExhausted("智谱 API 账户余额不足：已立即终止本轮任务，请充值后继续。")
+
 
 # 修改为智谱的标准对话 API 和 Embedding API
 CHAT_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
@@ -45,6 +73,20 @@ class ZhipuLLM(LLM_INTERFACE):
         }
         self.embedding_len = tar_len
         self.embedding_function = ZhipuEmbedding(self, self.embedding_len)
+        self.http_request_count = 0
+
+    def _post_once(self, url, data):
+        # CaseVO owns retries so every HTTP attempt crosses CountingLLM and is
+        # visible to the competition fuse counter.
+        self.http_request_count += 1
+        response = requests.post(
+            url,
+            headers=self.headers,
+            json=data,
+            timeout=REQUEST_TIMEOUT,
+        )
+        ensure_credit_available(response)
+        return response
     
     def send_message(self, prompt, json_flag=False):
         if not prompt or not prompt.strip():
@@ -59,22 +101,15 @@ class ZhipuLLM(LLM_INTERFACE):
             'max_tokens': 2048
         }
         
-        response = requests.post(CHAT_URL, headers=self.headers, json=data)
-        
-        while response.status_code == 429:
-            print('API rate limit exceeded, waiting 5 seconds...')
-            time.sleep(5)
-            response = requests.post(CHAT_URL, headers=self.headers, json=data)
+        response = self._post_once(CHAT_URL, data)
             
         if response.status_code == 200:
             result = json.loads(response.text)
             
             # 智谱敏感词拦截标志位
             if result['choices'][0].get('finish_reason') == 'sensitive':
-                print('Content filtered (sensitive), retrying...')
-                time.sleep(5)
-                response = requests.post(CHAT_URL, headers=self.headers, json=data)
-                result = json.loads(response.text)
+                # Let CaseVO retry this as a new, externally counted LLM call.
+                raise ValueError("Chat response was filtered as sensitive")
                 
             tmp_content = result['choices'][0]['message']['content'].strip()
             return tmp_content
@@ -93,12 +128,7 @@ class ZhipuLLM(LLM_INTERFACE):
             'model': 'embedding-3',
             'input': text_list
         }
-        response = requests.post(EMBEDDING_URL, headers=self.headers, json=data)
-        
-        while response.status_code == 429:
-            print('API rate limit exceeded, waiting 5 seconds...')
-            time.sleep(5)
-            response = requests.post(EMBEDDING_URL, headers=self.headers, json=data)
+        response = self._post_once(EMBEDDING_URL, data)
             
         if response.status_code == 200:
             result = json.loads(response.text)

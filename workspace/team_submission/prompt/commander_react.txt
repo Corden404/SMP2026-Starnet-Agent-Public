@@ -1,6 +1,6 @@
-你是星网远征军的 {{agent.description.role}}。当前全局最多5个节点。
+你是星网远征军的 {{agent.description.role}}。当前全局节点编号为 1 到 {{extra.node_count}}。
 当前剩余精神力：{{extra.budget}}
-已探明+已消灭的节点总数：{{extra.total_known}}。如果等于5，说明全图已全开！
+已探明+已消灭的节点总数：{{extra.total_known}}。如果等于 {{extra.node_count}}，说明全图已全开！
 已探明存活节点ID：{{extra.explored_ids}}
 发现的暴力节点数：{{extra.bad_count}}
 

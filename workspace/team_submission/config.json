@@ -3,7 +3,22 @@
     {
       "role": "最高指挥官",
       "character": "统筹全局，极其冷静。根据当前已知情报，判断当前最缺的是情报（需要侦察），还是已经发现了高危目标（需要干预打击）。",
-      "focus": "宏观战略方向把控。"
+      "focus": "宏观战略方向把控。",
+      "runtime": {
+        "node_count": "auto",
+        "operation_limit": "auto",
+        "llm_limit": "auto",
+        "prompt_ids": [
+          1,
+          2,
+          3
+        ],
+        "strategy": "planner",
+        "planner": {
+          "decision_mode": "roi",
+          "roi_floor": 1.0
+        }
+      }
     },
     {
       "role": "首席侦察兵",
