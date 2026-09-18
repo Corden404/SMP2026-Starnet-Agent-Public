@@ -75,12 +75,15 @@ class BaseStarAgent(AgentBase):
     def _run_chain(self, chain_name, input_data):
         with self.lock:
             chain = self.chains[chain_name]
+            self.last_chain_trace = {"status": "running", "chain": chain_name}
             try:
                 chain.set_input(input_data)
                 chain.run_step()
                 output = chain.get_output()
+                self.last_chain_trace["status"] = "returned"
                 return output.get("json") if isinstance(output, dict) else None
             except Exception as exc:
+                self.last_chain_trace.update(status="exception", exception_type=type(exc).__name__)
                 # CaseVO 0.3.19 leaves a failed chain in ``ready``. Reset it so a
                 # later round can use the same real ThoughtChain/JsonStep again.
                 if hasattr(chain, "status"):
@@ -255,13 +258,15 @@ class ParticipantSquadModel(ModelBase):
             raise ValueError("runtime.planner must be an object")
         options = {"learning": True, "scan_policy": "full", "decision_mode": "plan",
                    "depth": 2, "beam_width": 4, "plan_tolerance": .02,
-                   "roi_floor": .85, "min_scan_fraction": .7}
+                   "roi_floor": .85, "min_scan_fraction": .7,
+                   "rollout_width": 8, "rollout_samples": 3, "rollout_seconds": 3.0,
+                   "rollout_margin": .5, "rollout_combinations": False, "rollout_learning": False}
         for key in options:
             if key in planner:
                 options[key] = planner[key]
         if type(options["learning"]) is not bool:
             raise ValueError("planner.learning must be boolean")
-        if options["scan_policy"] not in ("full", "adaptive") or options["decision_mode"] not in ("plan", "roi"):
+        if options["scan_policy"] not in ("full", "adaptive") or options["decision_mode"] not in ("plan", "roi", "rollout", "information"):
             raise ValueError("invalid planner policy")
         for key, low, high in (("depth", 0, 3), ("beam_width", 1, 8)):
             if type(options[key]) is not int or not low <= options[key] <= high:
@@ -269,6 +274,15 @@ class ParticipantSquadModel(ModelBase):
         for key, low, high in (("plan_tolerance", 0, .2), ("roi_floor", .5, 1), ("min_scan_fraction", .4, 1)):
             if not ParticipantSquadModel._is_number(options[key]) or not low <= options[key] <= high:
                 raise ValueError("invalid planner threshold")
+        for key in ('rollout_combinations','rollout_learning'):
+            if type(options[key]) is not bool:raise ValueError('Invalid rollout boolean')
+        if type(options['rollout_width']) is not int or not 0 <= options['rollout_width'] <= 20:
+            raise ValueError('Invalid rollout width')
+        if type(options['rollout_samples']) is not int or options['rollout_samples'] not in (1,3,5,7):
+            raise ValueError('Invalid rollout sample count')
+        for key,maximum in [('rollout_seconds',30),('rollout_margin',20)]:
+            if not ParticipantSquadModel._is_number(options[key]) or not 0 <= options[key] <= maximum:
+                raise ValueError('Invalid rollout threshold')
         return {
             "strategy": strategy,
             "node_count": node_count,
@@ -960,7 +974,24 @@ class ParticipantSquadModel(ModelBase):
             action = self._action_dict('scan', self.scan_queue.pop(0))
         else:
             partial = self._next_scan_target() is not None
-            if self.planner_options['decision_mode'] == 'roi' and not partial:
+            if self.planner_options['decision_mode'] in ('rollout','information') and not partial:
+                plans = self._rollout_plans(budget)
+                if not plans:return self._stop('No positive rollout action')
+                top=plans[0]['predicted_final']
+                shortlist=plans[:1] if top is None else [p for p in plans[:4] if p['predicted_final'] >= top-.25]
+                decision=self.commander._run_chain('plan', {'budget':budget,
+                    'score':self._fast_score(self.local_nodes,self.local_edges)[0],
+                    'plans':json.dumps([{**p,'index':j} for j,p in enumerate(shortlist)],ensure_ascii=False),
+                    'history':json.dumps(self.action_history[-5:],ensure_ascii=False)})
+                chosen=decision.get('index') if isinstance(decision,dict) else None
+                valid_choice=type(chosen) is int and 0<=chosen<len(shortlist)
+                selected_plan=shortlist[chosen] if valid_choice else next(p for p in plans if p['baseline'])
+                if not valid_choice:chosen=None
+                action=selected_plan['first']
+                self.decision_history.append({'mode':self.planner_options['decision_mode'],'chosen':chosen,
+                    'plan':selected_plan,'candidate_count':len(plans),
+                    'invalid_choice_baseline_fallback':not valid_choice})
+            elif self.planner_options['decision_mode'] == 'roi' and not partial:
                 candidates = self._learned_candidates(budget)
                 if not candidates:
                     return self._stop('No positive action')
@@ -997,6 +1028,16 @@ class ParticipantSquadModel(ModelBase):
             before = dict(self.local_nodes[action['target_node_1']])
         return self._execute_planned_action(action, budget, before)
 
+    def _rollout_plans(self, budget):
+        reference=self._learned_candidates(budget)
+        if not reference:return []
+        slots=min(self.operation_limit-1-self.operation_count,
+                  self.llm_counter.safe_limit-self.llm_counter.call_count)
+        engine=BudgetRollout(self.local_nodes,self.local_edges,self.comm_effects,
+                             self.persona_observations,self.planner_options,slots,
+                             seed=417+1009*self.operation_count)
+        return engine.choose(budget,self.planner_options['decision_mode'],reference[0])
+
     def _scan_recovery_step(self, budget):
         # The commander already made a real decision that there is no useful
         # intervention; resume the scout next turn rather than fabricate gain.
@@ -1030,3 +1071,242 @@ class ParticipantSquadModel(ModelBase):
         if success and budget - ACTION_COSTS[action['action']] < .5:
             return self._stop('Budget exhausted')
         return 0
+
+
+class BudgetRollout:
+    """Public-state-only lookahead. Simulated outcomes never reach the real env."""
+    COST = {'comm':2.,'cut':3.,'shield':5.}
+
+    def __init__(self, nodes, edges, effects, observations, options, slots, seed=417):
+        import copy
+        self.initial=(copy.deepcopy(nodes),set(edges),dict(effects),copy.deepcopy(observations))
+        self.options=options
+        self.slots=max(0,slots)
+        self.seed=seed
+        self.cache={}
+        self.evaluations=0
+
+    @staticmethod
+    def metrics(nodes,edges):
+        adj={i:set() for i in nodes}
+        for u,v in edges:
+            if u in adj and v in adj:adj[u].add(v);adj[v].add(u)
+        seen=set();components=[];membership={};influence={};total=0.
+        for start in nodes:
+            if start in seen:continue
+            seen.add(start);stack=[start];comp=[]
+            while stack:
+                i=stack.pop();comp.append(i)
+                for j in adj[i]:
+                    if j not in seen:seen.add(j);stack.append(j)
+            den=sum(len(adj[i])+1 for i in comp)
+            num=sum((len(adj[i])+1)*nodes[i]['w'] for i in comp)
+            value=len(comp)*num/den
+            record=(set(comp),den,num,value)
+            components.append(record);total+=value
+            for i in comp:membership[i]=record;influence[i]=len(comp)*(len(adj[i])+1)/den
+        return total,influence,adj,membership
+
+    @staticmethod
+    def effect(i,data,effects,observations):
+        if i in effects:return effects[i],0.
+        prior={'和平':20.25,'中立':15.,'暴力':3.}.get(data['persona'],15.)
+        samples=list(observations.get(data['persona'],{}).values())
+        if not samples:return prior,abs(prior)*.35
+        mean=(2*prior+sum(samples))/(2+len(samples))
+        var=(2*(prior*.35)**2+sum((x-mean)**2 for x in samples))/(2+len(samples))
+        return mean,max(abs(mean)*.1,math.sqrt(var))
+
+    def candidates(self,state,budget,negative=False):
+        nodes,edges,effects,observations=state
+        score,influence,adj,membership=self.metrics(nodes,edges)
+        timer=[0];tin={};low={};bridges=set();articulation=set()
+        def dfs(u,parent=None):
+            tin[u]=low[u]=timer[0];timer[0]+=1;children=0
+            for v in adj[u]:
+                if v==parent:continue
+                if v in tin:low[u]=min(low[u],tin[v])
+                else:
+                    children+=1;dfs(v,u);low[u]=min(low[u],low[v])
+                    if low[v]>tin[u]:bridges.add(tuple(sorted((u,v))))
+                    if parent is not None and low[v]>=tin[u]:articulation.add(u)
+            if parent is None and children>1:articulation.add(u)
+        for u in nodes:
+            if u not in tin:dfs(u)
+        topology=(tuple(sorted(nodes)),tuple(sorted(edges)))
+        if topology not in self.cache:
+            if len(self.cache)>=96:self.cache.pop(next(iter(self.cache)))
+            self.cache[topology]={}
+        coefficients=self.cache[topology]
+        def structural_gain(key,ns,es):
+            if key not in coefficients:
+                new_influence=self.metrics(ns,es)[1]
+                coefficients[key]={i:new_influence.get(i,0.)-influence[i] for i in nodes}
+            return sum(c*nodes[i]['w'] for i,c in coefficients[key].items())
+        actions=[]
+        def add(kind,u,v,gain):
+            if negative or gain>.25:
+                actions.append({'action':kind,'target_node_1':u,'target_node_2':v,
+                                'prompt_id':1 if kind=='comm' else None,'cost':self.COST[kind],
+                                'gain':gain,'roi':gain/self.COST[kind]})
+        if budget>=2:
+            for i,d in nodes.items():
+                if d['comm_left']>0:
+                    mean,_=self.effect(i,d,effects,observations)
+                    add('comm',i,None,influence[i]*mean*.5**(3-d['comm_left']))
+        if budget>=5 and len(nodes)>1:
+            for i in nodes:
+                if i in articulation:
+                    ns={j:d for j,d in nodes.items() if j!=i}
+                    es={e for e in edges if i not in e}
+                    gain=structural_gain(('shield',i),ns,es)
+                else:
+                    comp,den,num,value=membership[i]
+                    if len(comp)==1:gain=-value
+                    else:
+                        denominator=den-2*len(adj[i])-1
+                        numerator=num-(len(adj[i])+1)*nodes[i]['w']-sum(nodes[j]['w'] for j in adj[i])
+                        gain=(len(comp)-1)*numerator/denominator-value
+                add('shield',i,None,gain)
+        if budget>=3:
+            for u,v in sorted(edges):
+                if u not in nodes or v not in nodes:continue
+                if (u,v) in bridges:
+                    gain=structural_gain(('cut',u,v),nodes,edges-{(u,v)})
+                else:
+                    comp,den,num,value=membership[u]
+                    gain=len(comp)*(num-nodes[u]['w']-nodes[v]['w'])/(den-2)-value
+                add('cut',u,v,gain)
+        actions.sort(key=lambda a:(-a['roi'],-a['gain'],a['target_node_1']))
+        return actions
+
+    @staticmethod
+    def clone(state):
+        nodes,edges,effects,observations=state
+        return ({i:dict(d) for i,d in nodes.items()},set(edges),dict(effects),
+                {p:dict(values) for p,values in observations.items()})
+
+    def apply(self,state,action,latent,learn):
+        nodes,edges,effects,observations=self.clone(state)
+        u,v=action['target_node_1'],action['target_node_2'];kind=action['action']
+        if kind=='comm':
+            if u not in nodes or nodes[u]['comm_left']<=0:raise ValueError('Illegal simulated comm')
+            effect=latent[u]
+            d=nodes[u];d['w']+=effect*.5**(3-d['comm_left']);d['comm_left']-=1
+            if learn:
+                effects[u]=effect;observations.setdefault(d['persona'],{})[u]=effect
+        elif kind=='shield':
+            if u not in nodes:raise ValueError('Illegal simulated shield')
+            del nodes[u];edges={e for e in edges if u not in e}
+        elif kind=='cut':
+            edge=tuple(sorted((u,v)))
+            if edge not in edges:raise ValueError('Illegal simulated cut')
+            edges.remove(edge)
+        else:raise ValueError('Unknown action')
+        return nodes,edges,effects,observations
+
+    def continuation(self,state,budget,slots,latent,learn,prefix=(),deadline=None):
+        import time
+        actions=[]
+        for a in prefix:
+            if slots<=0 or budget<a['cost']:return None
+            state=self.apply(state,a,latent,learn);budget-=a['cost'];slots-=1;actions.append(a)
+        while slots>0 and budget>=2:
+            if deadline is not None and time.monotonic()>deadline:raise TimeoutError('Rollout time budget')
+            candidates=self.candidates(state,budget)
+            if not candidates:break
+            a=candidates[0];state=self.apply(state,a,latent,learn)
+            budget-=a['cost'];slots-=1;actions.append(a)
+        return {'score':self.metrics(state[0],state[1])[0],'actions':actions,'remaining_budget':budget}
+
+    @staticmethod
+    def key(a):return a['action'],a['target_node_1'],a['target_node_2']
+
+    def choose(self,budget,mode='rollout',baseline_action=None):
+        import random
+        import time
+        start=time.monotonic()
+        candidates=self.candidates(self.initial,budget)
+        if not candidates or self.slots<=0:return []
+        fallback=baseline_action or candidates[0]
+        fallback_plan={'first':fallback,'predicted_final':None,'uncertainty':None,
+                       'baseline':True,'search_completed':False,'reason':'search-disabled-or-timeout'}
+        seconds=self.options.get('rollout_seconds',1.5)
+        width=self.options.get('rollout_width',8)
+        if seconds<=0 or width<=0:return [fallback_plan]
+        deadline=start+seconds
+        nodes,edges,effects,observations=self.initial
+        means={i:self.effect(i,d,effects,observations)[0] for i,d in nodes.items()}
+        count=self.options.get('rollout_samples',3)
+        rng=random.Random(self.seed)
+        scenarios=[means]
+        # Antithetic predictive scenarios, fixed per node for the whole future.
+        for pair in range((count-1)//2):
+            z={i:rng.gauss(0,1) for i in sorted(nodes)}
+            for sign in (-1,1):
+                scenarios.append({i:means[i]+sign*z[i]*self.effect(i,nodes[i],effects,observations)[1]
+                                  for i in nodes})
+        prefixes=[(fallback,)]
+        if mode=='information':
+            extras=[a for a in candidates if a['action']=='comm' and a['target_node_1'] not in effects]
+        else:
+            extras=[]
+            for kind in ('comm','shield','cut'):
+                extras.extend([a for a in candidates if a['action']==kind][:max(1,width//3)])
+            extras.extend(candidates[:width])
+        seen={self.key(fallback)}
+        for a in extras:
+            if self.key(a) not in seen:
+                prefixes.append((a,));seen.add(self.key(a))
+            if len(prefixes)>=width:break
+        learn=self.options.get('rollout_learning',False)
+        if self.options.get('rollout_combinations',False) and mode!='information':
+            # Include short-term negative structure choices before terminal comparison.
+            structure=[a for a in self.candidates(self.initial,budget,negative=True) if a['action']!='comm']
+            ordered=sorted(structure,key=lambda a:(-a['roi'],a['target_node_1']))
+            structure=ordered[:2]
+            for kind in ('shield','cut'):
+                extra=next((a for a in ordered if a['action']==kind and a['gain']<=.25 and a not in structure),None)
+                if extra is not None:structure.append(extra)
+            structure += [a for a in ordered if a not in structure][:4-len(structure)]
+            for a in structure:
+                state=self.apply(self.initial,a,means,False)
+                follow=[b for b in self.candidates(state,budget-a['cost'],negative=True) if b['action']!='comm'][:2]
+                for b in follow:
+                    if self.slots>=2:prefixes.append((a,b))
+        plans=[]
+        truncated=False
+        try:
+            # Baseline Q uses the same first action, scenarios and learning convention.
+            for index,prefix in enumerate(prefixes):
+                outcomes=[]
+                for latent in scenarios:
+                    result=self.continuation(self.initial,budget,self.slots,latent,learn,prefix,deadline)
+                    if result is None:break
+                    outcomes.append(result['score']);self.evaluations+=1
+                if len(outcomes)!=len(scenarios):continue
+                mean=sum(outcomes)/len(outcomes)
+                plans.append({'first':prefix[0],'structure':[self.key(a) for a in prefix],
+                              'predicted_final':mean,'uncertainty':math.sqrt(sum((x-mean)**2 for x in outcomes)/len(outcomes)),
+                              'worst_scenario':min(outcomes),'baseline':index==0,'search_completed':True,
+                              'comm_count':sum(a['action']=='comm' for a in result['actions']),
+                              'remaining_budget':result['remaining_budget']})
+        except TimeoutError:
+            # Keep fully evaluated candidates only; never compare partial sample means.
+            truncated=True
+        if not plans:return [fallback_plan]
+        base=plans[0]
+        eligible=[p for p in plans if p['predicted_final']>=base['predicted_final']+self.options.get('rollout_margin',.5)]
+        eligible.append(base)
+        eligible.sort(key=lambda p:(-p['predicted_final'],p['uncertainty']))
+        # Keep one plan per first action; the LLM compares near-best final value.
+        unique=[];seen=set()
+        for p in eligible:
+            key=self.key(p['first'])
+            if key in seen:continue
+            seen.add(key);p['baseline_final']=base['predicted_final']
+            p['search_truncated']=truncated;p['evaluated_prefixes']=len(plans);p['proposed_prefixes']=len(prefixes)
+            p['seconds']=time.monotonic()-start;p['evaluations']=self.evaluations
+            unique.append(p)
+        if not any(p['baseline'] for p in unique):unique.append(base)
+        return unique

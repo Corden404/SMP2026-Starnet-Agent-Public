@@ -18,6 +18,7 @@ GLM-APIKEY.txt
 vendor/
 dist/
 *.zip
+*.7z
 
 # Runtime outputs
 log/

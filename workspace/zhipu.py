@@ -66,7 +66,7 @@ class ZhipuEmbedding(EmbeddingFunction):
 
 
 class ZhipuLLM(LLM_INTERFACE):
-    def __init__(self, tar_key, tar_len):
+    def __init__(self, tar_key, tar_len, model_config=None):
         self.headers = {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + tar_key
@@ -74,6 +74,14 @@ class ZhipuLLM(LLM_INTERFACE):
         self.embedding_len = tar_len
         self.embedding_function = ZhipuEmbedding(self, self.embedding_len)
         self.http_request_count = 0
+        self.model_config = {"provider": "zhipu", "endpoint": CHAT_URL,
+                             "model": "glm-4-plus", "temperature": 0.3,
+                             "top_p": 0.85, "max_tokens": 2048, "json_mode": False}
+        if model_config:
+            if set(model_config) - (set(self.model_config) | {"thinking", "seed"}):
+                raise ValueError("Unsupported model configuration fields")
+            self.model_config.update(model_config)
+        self.response_metadata = []
 
     def _post_once(self, url, data):
         # CaseVO owns retries so every HTTP attempt crosses CountingLLM and is
@@ -94,17 +102,24 @@ class ZhipuLLM(LLM_INTERFACE):
 
         # 调用 GLM-4 模型
         data = {
-            'model': 'glm-4-plus',  
+            'model': self.model_config['model'],
             'messages': [{'role': 'user', 'content': prompt}],
-            'temperature': 0.3,
-            'top_p': 0.85,
-            'max_tokens': 2048
+            'temperature': self.model_config['temperature'],
+            'top_p': self.model_config['top_p'],
+            'max_tokens': self.model_config['max_tokens']
         }
         
-        response = self._post_once(CHAT_URL, data)
+        for field in ('thinking', 'seed'):
+            if field in self.model_config:
+                data[field] = self.model_config[field]
+        if json_flag and self.model_config['json_mode']:
+            data['response_format'] = {'type': 'json_object'}
+        response = self._post_once(self.model_config['endpoint'], data)
             
         if response.status_code == 200:
             result = json.loads(response.text)
+            self.response_metadata.append({k: result.get(k, 'unknown') for k in ('id', 'model', 'usage')})
+            self.response_metadata[-1]['finish_reason'] = result['choices'][0].get('finish_reason', 'unknown')
             
             # 智谱敏感词拦截标志位
             if result['choices'][0].get('finish_reason') == 'sensitive':

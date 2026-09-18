@@ -187,10 +187,13 @@ def fast_model(env, people, model_class=ParticipantSquadModel):
 def run_one(case,variant,remote=False,repeat=0,output=None):
     seed=seed_for(case)
     source_hash=code_hash()
+    runner_fingerprint=digest({'files':{name:hashlib.sha256((ROOT/'workspace'/name).read_bytes()).hexdigest()
+        for name in ('experiment_round3.py','api_client.py','zhipu.py')},
+        'model':ZhipuLLM('placeholder',5).model_config if remote else {'model':'deterministic-first-choice'}})
     path=(output or OUT/('remote' if remote else 'proxy'))/(case+'-'+variant+f'-r{repeat}.json')
     if path.exists():
         old=json.loads(path.read_text(encoding='utf-8'))
-        if old.get('source_hash')==source_hash and old.get('variant_config')==VARIANTS[variant] and 'final_score' in old:
+        if old.get('runner_fingerprint')==runner_fingerprint and old.get('source_hash')==source_hash and old.get('variant_config')==VARIANTS[variant] and 'final_score' in old:
             print(json.dumps({'cached':str(path),'score':old['final_score']}),flush=True)
             return old
         raise RuntimeError('Existing result differs; use a new output directory: '+str(path))
@@ -232,7 +235,8 @@ def run_one(case,variant,remote=False,repeat=0,output=None):
     if step>=limit:raise RuntimeError('Model reached fuse without returning early')
     budget=env.get_remaining_budget()
     result={'case':case,'variant':variant,'variant_config':VARIANTS[variant],
-        'evaluation':'official sandbox + real glm-4-plus' if remote else 'PROXY estimator + deterministic first-choice policy; NOT official score',
+        'evaluation':('official sandbox + '+llm.model_config['model']) if remote else 'PROXY estimator + deterministic first-choice policy; NOT official score',
+        'runner_fingerprint':runner_fingerprint,'model_config':llm.model_config if remote else None,
         'repeat':repeat,'natural_score':natural,'steps':step,'llm_calls':model.llm_counter.call_count,
         'http_llm_calls':llm.http_request_count,'remaining_budget':budget,'stop_reason':model.stop_reason,
         'elapsed_seconds':round(time.monotonic()-start,3),'harness_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'source_hash':source_hash,'seed_sha256':digest(seed),
