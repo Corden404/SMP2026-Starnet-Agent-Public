@@ -75,15 +75,12 @@ class BaseStarAgent(AgentBase):
     def _run_chain(self, chain_name, input_data):
         with self.lock:
             chain = self.chains[chain_name]
-            self.last_chain_trace = {"status": "running", "chain": chain_name}
             try:
                 chain.set_input(input_data)
                 chain.run_step()
                 output = chain.get_output()
-                self.last_chain_trace["status"] = "returned"
                 return output.get("json") if isinstance(output, dict) else None
             except Exception as exc:
-                self.last_chain_trace.update(status="exception", exception_type=type(exc).__name__)
                 # CaseVO 0.3.19 leaves a failed chain in ``ready``. Reset it so a
                 # later round can use the same real ThoughtChain/JsonStep again.
                 if hasattr(chain, "status"):
@@ -258,15 +255,13 @@ class ParticipantSquadModel(ModelBase):
             raise ValueError("runtime.planner must be an object")
         options = {"learning": True, "scan_policy": "full", "decision_mode": "plan",
                    "depth": 2, "beam_width": 4, "plan_tolerance": .02,
-                   "roi_floor": .85, "min_scan_fraction": .7,
-                   "rollout_width": 8, "rollout_samples": 3, "rollout_seconds": 3.0,
-                   "rollout_margin": .5, "rollout_combinations": False, "rollout_learning": False}
+                   "roi_floor": .85, "min_scan_fraction": .7}
         for key in options:
             if key in planner:
                 options[key] = planner[key]
         if type(options["learning"]) is not bool:
             raise ValueError("planner.learning must be boolean")
-        if options["scan_policy"] not in ("full", "adaptive") or options["decision_mode"] not in ("plan", "roi", "rollout", "information"):
+        if options["scan_policy"] not in ("full", "adaptive") or options["decision_mode"] not in ("plan", "roi"):
             raise ValueError("invalid planner policy")
         for key, low, high in (("depth", 0, 3), ("beam_width", 1, 8)):
             if type(options[key]) is not int or not low <= options[key] <= high:
@@ -274,15 +269,6 @@ class ParticipantSquadModel(ModelBase):
         for key, low, high in (("plan_tolerance", 0, .2), ("roi_floor", .5, 1), ("min_scan_fraction", .4, 1)):
             if not ParticipantSquadModel._is_number(options[key]) or not low <= options[key] <= high:
                 raise ValueError("invalid planner threshold")
-        for key in ('rollout_combinations','rollout_learning'):
-            if type(options[key]) is not bool:raise ValueError('Invalid rollout boolean')
-        if type(options['rollout_width']) is not int or not 0 <= options['rollout_width'] <= 20:
-            raise ValueError('Invalid rollout width')
-        if type(options['rollout_samples']) is not int or options['rollout_samples'] not in (1,3,5,7):
-            raise ValueError('Invalid rollout sample count')
-        for key,maximum in [('rollout_seconds',30),('rollout_margin',20)]:
-            if not ParticipantSquadModel._is_number(options[key]) or not 0 <= options[key] <= maximum:
-                raise ValueError('Invalid rollout threshold')
         return {
             "strategy": strategy,
             "node_count": node_count,
@@ -974,24 +960,7 @@ class ParticipantSquadModel(ModelBase):
             action = self._action_dict('scan', self.scan_queue.pop(0))
         else:
             partial = self._next_scan_target() is not None
-            if self.planner_options['decision_mode'] in ('rollout','information') and not partial:
-                plans = self._rollout_plans(budget)
-                if not plans:return self._stop('No positive rollout action')
-                top=plans[0]['predicted_final']
-                shortlist=plans[:1] if top is None else [p for p in plans[:4] if p['predicted_final'] >= top-.25]
-                decision=self.commander._run_chain('plan', {'budget':budget,
-                    'score':self._fast_score(self.local_nodes,self.local_edges)[0],
-                    'plans':json.dumps([{**p,'index':j} for j,p in enumerate(shortlist)],ensure_ascii=False),
-                    'history':json.dumps(self.action_history[-5:],ensure_ascii=False)})
-                chosen=decision.get('index') if isinstance(decision,dict) else None
-                valid_choice=type(chosen) is int and 0<=chosen<len(shortlist)
-                selected_plan=shortlist[chosen] if valid_choice else next(p for p in plans if p['baseline'])
-                if not valid_choice:chosen=None
-                action=selected_plan['first']
-                self.decision_history.append({'mode':self.planner_options['decision_mode'],'chosen':chosen,
-                    'plan':selected_plan,'candidate_count':len(plans),
-                    'invalid_choice_baseline_fallback':not valid_choice})
-            elif self.planner_options['decision_mode'] == 'roi' and not partial:
+            if self.planner_options['decision_mode'] == 'roi' and not partial:
                 candidates = self._learned_candidates(budget)
                 if not candidates:
                     return self._stop('No positive action')
@@ -1028,16 +997,6 @@ class ParticipantSquadModel(ModelBase):
             before = dict(self.local_nodes[action['target_node_1']])
         return self._execute_planned_action(action, budget, before)
 
-    def _rollout_plans(self, budget):
-        reference=self._learned_candidates(budget)
-        if not reference:return []
-        slots=min(self.operation_limit-1-self.operation_count,
-                  self.llm_counter.safe_limit-self.llm_counter.call_count)
-        engine=BudgetRollout(self.local_nodes,self.local_edges,self.comm_effects,
-                             self.persona_observations,self.planner_options,slots,
-                             seed=417+1009*self.operation_count)
-        return engine.choose(budget,self.planner_options['decision_mode'],reference[0])
-
     def _scan_recovery_step(self, budget):
         # The commander already made a real decision that there is no useful
         # intervention; resume the scout next turn rather than fabricate gain.
@@ -1072,6 +1031,13 @@ class ParticipantSquadModel(ModelBase):
             return self._stop('Budget exhausted')
         return 0
 
+
+# Standalone adapter for the measured round5 D-search, no experimental seed/oracle access.
+
+import time
+from functools import lru_cache
+
+B0 = ParticipantSquadModel
 
 class BudgetRollout:
     """Public-state-only lookahead. Simulated outcomes never reach the real env."""
@@ -1310,3 +1276,418 @@ class BudgetRollout:
             unique.append(p)
         if not any(p['baseline'] for p in unique):unique.append(base)
         return unique
+
+MODEL_VERSION = 'finite50-sparse-transpose-v1'
+
+@lru_cache(maxsize=2048)
+def coefficients(ids, edges, mode=MODEL_VERSION):
+    adj={i:{i} for i in ids}
+    for u,v in edges:
+        if u in adj and v in adj:adj[u].add(v);adj[v].add(u)
+    if mode=='stationary':
+        remaining=set(ids);c={}
+        while remaining:
+            stack=[remaining.pop()];component=[]
+            while stack:
+                i=stack.pop();component.append(i)
+                for j in adj[i]&remaining:remaining.remove(j);stack.append(j)
+            denominator=sum(len(adj[i]) for i in component)
+            for i in component:c[i]=len(component)*len(adj[i])/denominator
+        return tuple(c[i] for i in ids)
+    if mode!=MODEL_VERSION:raise ValueError(mode)
+    c={i:1. for i in ids}
+    for _ in range(50):
+        nxt={i:0. for i in ids}
+        for i,neighbors in adj.items():
+            weight=c[i]/len(neighbors)
+            for j in neighbors:nxt[j]+=weight
+        c=nxt
+    return tuple(c[i] for i in ids)
+
+def score(nodes, edges, mode='finite50'):
+    ids=tuple(sorted(nodes));effective=tuple(sorted({tuple(sorted((u,v))) for u,v in edges if u in nodes and v in nodes and u!=v}))
+    c=coefficients(ids,effective,MODEL_VERSION if mode=='finite50' else mode)
+    return sum(nodes[i]['w']*value for i,value in zip(ids,c)),dict(zip(ids,c))
+
+class F0(B0):
+    estimate_score=staticmethod(score)
+    _fast_score=staticmethod(score)
+
+class FiniteRollout(BudgetRollout):
+    @staticmethod
+    def metrics(nodes,edges):
+        total,influence=score(nodes,edges)
+        adj={i:set() for i in nodes}
+        for u,v in edges:
+            if u in adj and v in adj:adj[u].add(v);adj[v].add(u)
+        return total,influence,adj,{}
+
+    def candidates(self,state,budget,negative=False):
+        nodes,edges,effects,observations=state
+        total,influence=score(nodes,edges);actions=[]
+        def add(kind,u,v,gain):
+            if negative or gain>.25:
+                actions.append({'action':kind,'target_node_1':u,'target_node_2':v,
+                    'prompt_id':1 if kind=='comm' else None,'cost':self.COST[kind],
+                    'gain':gain,'roi':gain/self.COST[kind]})
+        if budget>=2:
+            for i,d in nodes.items():
+                if d['comm_left']>0:add('comm',i,None,influence[i]*self.effect(i,d,effects,observations)[0]*.5**(3-d['comm_left']))
+        if budget>=5 and len(nodes)>1:
+            for i in nodes:
+                ns={j:d for j,d in nodes.items() if j!=i};es={e for e in edges if i not in e}
+                add('shield',i,None,score(ns,es)[0]-total)
+        if budget>=3:
+            for u,v in sorted(edges):
+                if u in nodes and v in nodes:add('cut',u,v,score(nodes,edges-{(u,v)})[0]-total)
+        actions.sort(key=lambda a:(-a['roi'],-a['gain'],a['target_node_1']))
+        return actions
+
+def update_response(effects,observations,node,before,after):
+    first=(after-before['w'])/(.5**max(0,3-before['comm_left']))
+    effects[node]=first;observations.setdefault(before['persona'],{})[node]=first
+
+class L0(F0):
+    def _execute_planned_action(self,action,budget,before):
+        result=super()._execute_planned_action(action,budget,before)
+        if action['action']=='comm' and self.action_history[-1]['success']:
+            i=action['target_node_1'];update_response(self.comm_effects,self.persona_observations,i,before,self.local_nodes[i]['w'])
+        return result
+
+SEARCH = {'rollout_seconds': 3.0, 'rollout_width': 2, 'rollout_samples': 1, 'rollout_learning': False, 'rollout_combinations': False, 'rollout_margin': 0.5}
+
+
+class ParticipantSquadModel(L0):
+    """Finite50 plus the evaluated two-prefix mean-only search; real CaseVO chains."""
+    def __init__(self, host_env, person_list, llm):
+        super().__init__(host_env, person_list, llm)
+        self.search_records = []
+
+    def _learned_candidates(self, budget):
+        reference = super()._learned_candidates(budget)
+        if not reference:
+            return reference
+        slots = min(self.operation_limit - 1 - self.operation_count,
+                    self.llm_counter.safe_limit - self.llm_counter.call_count)
+        rollout = FiniteRollout(self.local_nodes, self.local_edges,
+                                self.comm_effects, self.persona_observations,
+                                SEARCH, slots)
+        start = time.monotonic()
+        plans = rollout.choose(budget, baseline_action=reference[0])
+        self.search_records.append({'operation': self.operation_count,
+                                    'seconds': time.monotonic() - start, 'plans': plans})
+        return [plans[0]['first']] if plans else reference
+
+import types
+D5 = types.SimpleNamespace(ParticipantSquadModel=ParticipantSquadModel, FiniteRollout=FiniteRollout, score=score, SEARCH=SEARCH, L0=L0)
+"""Late scan stop with a persistent phase and explicit unobserved vertices.
+
+Public incident edges are retained. Unseen attributes use the scanned mean at
+the stop boundary; unseen-unseen edges are assumed absent (diagnostic limitation).
+Unscanned vertices are never eligible intervention targets.
+"""
+import time
+
+
+class RestrictedRollout(D5.FiniteRollout):
+    def __init__(self,*args,eligible,**kwargs):
+        super().__init__(*args,**kwargs);self.eligible=set(eligible)
+
+    def candidates(self,state,budget,negative=False):
+        return [a for a in super().candidates(state,budget,negative)
+                if a['target_node_1'] in self.eligible and
+                (a['action']!='cut' or a['target_node_2'] in self.eligible)]
+
+class LateScanStop(D5.ParticipantSquadModel):
+    scan_target=50
+    def __init__(self,host_env,person_list,llm):
+        super().__init__(host_env,person_list,llm)
+        self.scan_stop_reached=False;self.scan_diagnostic_records=[]
+
+    def _next_scan_target(self):
+        # This sentinel marks the intervention phase, not graph completeness.
+        # Partial states are explicitly completed inside _learned_candidates.
+        if self.scan_stop_reached:return None
+        return super()._next_scan_target()
+
+    def _should_scan(self,budget):
+        if self.scan_stop_reached:return False
+        if len(self.local_nodes)+len(self.dead_nodes)>=self.scan_target:
+            self.scan_stop_reached=True;self.scan_closed=True
+            self.unseen_w=sum(d['w'] for d in self.local_nodes.values())/max(1,len(self.local_nodes))
+            self.scan_diagnostic_records.append(dict(event='stop',scanned=self._known_count(),
+                budget=budget,unseen_w=self.unseen_w))
+            return False
+        return super()._should_scan(budget)
+
+    def completed_state(self):
+        nodes={i:dict(d) for i,d in self.local_nodes.items()}
+        unknown=set(range(1,self.node_count+1))-set(nodes)-self.dead_nodes
+        for i in unknown:nodes[i]=dict(w=self.unseen_w,persona='unobserved',comm_left=0)
+        edges={e for e in self.local_edges if all(i in nodes for i in e)}
+        return nodes,edges,dict(self.comm_effects),{p:dict(v) for p,v in self.persona_observations.items()}
+
+    def _learned_candidates(self,budget):
+        unknown=set(range(1,self.node_count+1))-set(self.local_nodes)-self.dead_nodes
+        if not unknown:return super()._learned_candidates(budget)
+        state=self.completed_state()
+        slots=min(self.operation_limit-1-self.operation_count,
+                  self.llm_counter.safe_limit-self.llm_counter.call_count)
+        engine=RestrictedRollout(*state,D5.SEARCH,slots,eligible=self.local_nodes)
+        reference=engine.candidates(engine.initial,budget)
+        if not reference:return reference
+        start=time.monotonic();plans=engine.choose(budget,baseline_action=reference[0])
+        self.search_records.append(dict(operation=self.operation_count,
+            seconds=time.monotonic()-start,plans=plans))
+        self.scan_diagnostic_records.append(dict(event='intervention',operation=self.operation_count,
+            known_alive=len(self.local_nodes),dead=len(self.dead_nodes),unseen=len(unknown),
+            graph_vertices=len(state[0]),structural_candidates=sum(a['action']!='comm' for a in reference)))
+        return [plans[0]['first']] if plans else reference
+
+class S48(LateScanStop):scan_target=48
+class S49(LateScanStop):scan_target=49
+class S50(LateScanStop):scan_target=50
+CLASSES={'S48':S48,'S49':S49,'S50':S50}
+
+class ParticipantSquadModel(S48):
+    def __init__(self, host_env, person_list, llm):
+        super().__init__(host_env, person_list, llm)
+        if self.node_count != 50:
+            self.scan_target = self.node_count
+
+
+class ParticipantSquadModel(ParticipantSquadModel):
+    """Validated late scan stop for the 50-node competition only."""
+    scan_target = 44
+
+
+"""PC2: same S44 root actions, coupled responses, bounded feedback re-planning.
+
+Appended to the exact S44 archive. No external environment, seed, network or key
+is accessed by hypothetical branches. Four fixed decision windows; 3 public
+predictive worlds; two S44 numerical re-plans then feedback-greedy continuation.
+This is a bounded approximate lookahead, NOT the entire recursive S44 policy.
+The optional NumPy scorer accelerates ONLY private hypothetical branches. The
+real baseline selector and its 3s/search2 limits remain byte-identical.
+"""
+import hashlib as _pc_hash
+import random as _pc_random
+try:
+    import numpy as _pc_np
+except ImportError:
+    _pc_np = None
+
+_PC2Base = ParticipantSquadModel
+
+
+@lru_cache(maxsize=2048)
+def pc2_coefficients(ids, edges):
+    if _pc_np is None:
+        return coefficients(ids, edges)
+    n = len(ids)
+    if not n:
+        return ()
+    positions = {node: i for i, node in enumerate(ids)}
+    matrix = _pc_np.eye(n, dtype=float)
+    for u, v in edges:
+        i, j = positions[u], positions[v]
+        matrix[i, j] = matrix[j, i] = 1.
+    transition = (matrix / matrix.sum(axis=1)[:, None]).T.copy()
+    values = _pc_np.ones(n, dtype=float)
+    for _ in range(50):
+        values = transition @ values
+    return tuple(float(v) for v in values)
+
+
+def pc2_score(nodes, edges):
+    ids = tuple(sorted(nodes))
+    effective = tuple(sorted({tuple(sorted(e)) for e in edges
+                              if e[0] in nodes and e[1] in nodes and e[0] != e[1]}))
+    values = pc2_coefficients(ids, effective)
+    return sum(nodes[i]['w'] * v for i, v in zip(ids, values)), dict(zip(ids, values))
+
+
+class PC2Rollout(RestrictedRollout):
+    """Same candidate formula and ordering, private mathematically equal scorer."""
+    @staticmethod
+    def metrics(nodes, edges):
+        value, influence = pc2_score(nodes, edges)
+        adjacency = {i: set() for i in nodes}
+        for u, v in edges:
+            if u in adjacency and v in adjacency:
+                adjacency[u].add(v); adjacency[v].add(u)
+        return value, influence, adjacency, {}
+
+    def candidates(self, state, budget, negative=False):
+        nodes, edges, effects, observations = state
+        value, influence = pc2_score(nodes, edges)
+        actions = []
+        def add(kind, u, v, gain):
+            if (negative or gain > .25) and u in self.eligible and (kind != 'cut' or v in self.eligible):
+                actions.append(dict(action=kind, target_node_1=u, target_node_2=v,
+                    prompt_id=1 if kind == 'comm' else None, cost=self.COST[kind], gain=gain, roi=gain/self.COST[kind]))
+        if budget >= 2:
+            for i, d in nodes.items():
+                if d['comm_left'] > 0:
+                    mean = self.effect(i, d, effects, observations)[0]
+                    add('comm', i, None, influence[i]*mean*.5**(3-d['comm_left']))
+        if budget >= 5 and len(nodes) > 1:
+            for i in nodes:
+                if i in self.eligible:
+                    ns = {j: d for j, d in nodes.items() if j != i}
+                    add('shield', i, None, pc2_score(ns, {e for e in edges if i not in e})[0]-value)
+        if budget >= 3:
+            for u, v in sorted(edges):
+                if u in nodes and v in nodes and u in self.eligible and v in self.eligible:
+                    add('cut', u, v, pc2_score(nodes, edges-{(u,v)})[0]-value)
+        actions.sort(key=lambda a: (-a['roi'], -a['gain'], a['target_node_1']))
+        return actions
+
+
+def pc2_pair(engine, budget):
+    actions = engine.candidates(engine.initial, budget)
+    if not actions:
+        return []
+    pair = [actions[0]]
+    extras = []
+    for kind in ('comm', 'shield', 'cut'):
+        extras.extend([a for a in actions if a['action'] == kind][:1])
+    extras.extend(actions[:2])
+    for action in extras:
+        if engine.key(action) != engine.key(pair[0]):
+            pair.append(action)
+            break
+    return pair
+
+
+def pc2_worlds(state):
+    nodes, edges, effects, observations = state
+    if any('r' in d or 'latent' in d or 'response' in d for d in nodes.values()):
+        raise ValueError('Hidden attributes are not public policy input')
+    signature = repr((tuple((i,d['w'],d['persona'],d['comm_left']) for i,d in sorted(nodes.items())),
+                      tuple(sorted(edges)),tuple(sorted(effects.items())),
+                      tuple((p,tuple(sorted(v.items()))) for p,v in sorted(observations.items()))))
+    rng = _pc_random.Random(int(_pc_hash.sha256(signature.encode()).hexdigest()[:16],16))
+    estimates = {i: BudgetRollout.effect(i,d,effects,observations) for i,d in nodes.items()}
+    noise = {i: rng.gauss(0.,1.) for i in sorted(nodes)}
+    worlds = []
+    for sign in (0,-1,1):
+        worlds.append({i:effects[i] if i in effects else max(0.,mu+sign*noise[i]*sd)
+                       for i,(mu,sd) in estimates.items()})
+    return worlds
+
+
+def pc2_next(state, budget, slots, eligible, deadline, replan=True):
+    if time.monotonic() >= deadline:
+        raise TimeoutError('PC2 branch deadline')
+    options = dict(SEARCH, rollout_seconds=min(SEARCH['rollout_seconds'], max(0.,deadline-time.monotonic())))
+    engine = PC2Rollout(*state, options, slots, eligible=eligible)
+    candidates = engine.candidates(engine.initial, budget)
+    if not candidates:
+        return None
+    if not replan:
+        return candidates[0]
+    plans = engine.choose(budget, baseline_action=candidates[0])
+    if not plans or not plans[0].get('search_completed') or plans[0].get('search_truncated'):
+        raise TimeoutError('Incomplete hypothetical S44 selection')
+    return plans[0]['first']
+
+
+def pc2_continue(initial, budget, slots, eligible, first, world, deadline, depth=2):
+    # The selector gets ONLY belief. World response is delivered AFTER the action.
+    state = BudgetRollout.clone(initial)
+    chosen = first
+    actions = []
+    engine = PC2Rollout(*state, SEARCH, slots, eligible=eligible)
+    while chosen is not None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('PC2 suffix incomplete')
+        if (slots <= 0 or chosen['cost'] > budget or chosen['target_node_1'] not in eligible
+                or (chosen['action'] == 'cut' and chosen['target_node_2'] not in eligible)):
+            raise ValueError('Illegal hypothetical action')
+        state = engine.apply(state, chosen, world, True)
+        budget -= chosen['cost']; slots -= 1
+        actions.append(BudgetRollout.key(chosen))
+        if budget < 2 or slots <= 0:
+            break
+        chosen = pc2_next(state,budget,slots,eligible,deadline,replan=len(actions)<=depth)
+    if time.monotonic() >= deadline:
+        raise TimeoutError('PC2 value incomplete')
+    return dict(score=pc2_score(state[0],state[1])[0],actions=actions,budget=budget,slots=slots)
+
+
+def pc2_compare(state,budget,slots,eligible,incumbent,challenger,seconds=3.,depth=2,margin=.5):
+    if seconds <= 0:
+        return incumbent,dict(reason='timeout_keep_original',completed_worlds=0)
+    deadline = time.monotonic()+seconds
+    worlds = pc2_worlds(state)
+    values = []
+    try:
+        for index,world in enumerate(worlds):
+            outcomes = {}
+            order = (0,1) if index%2==0 else (1,0)
+            for branch in order:
+                first = incumbent if branch==0 else challenger
+                outcomes[branch] = pc2_continue(state,budget,slots,eligible,first,world,deadline,depth)
+            values.append(dict(incumbent=outcomes[0]['score'],challenger=outcomes[1]['score'],
+                               delta=outcomes[1]['score']-outcomes[0]['score']))
+    except TimeoutError:
+        return incumbent,dict(reason='incomplete_keep_original',completed_worlds=len(values))
+    gain = sum(v['delta'] for v in values)/len(values)
+    replaced = gain >= margin and BudgetRollout.key(challenger)!=BudgetRollout.key(incumbent)
+    return (challenger if replaced else incumbent),dict(reason='replaced' if replaced else 'no_margin',
+        completed_worlds=len(values),predicted_delta=gain,replaced=replaced,worlds=values,
+        posterior_calibrated=False,replan_depth=depth)
+
+
+class ParticipantSquadModel(_PC2Base):
+    pc2_seconds = 3.0
+    pc2_depth = 2
+    pc2_margin = 0.5
+
+    def __init__(self,host_env,person_list,llm):
+        super().__init__(host_env,person_list,llm)
+        self._pc2_init()
+
+    def _pc2_init(self):
+        self.pc2_records = []
+        self._pc2_seen = set()
+
+    def _learned_candidates(self,budget):
+        if not hasattr(self,'pc2_records'):
+            self._pc2_init()
+        original = _PC2Base._learned_candidates(self,budget)
+        if self.node_count != 50 or not original:
+            return original
+        tags = (['first'] if self.operation_count==44 else [])
+        tags += ['budget'+str(b) for b in (40,20,10) if budget<=b]
+        new = [t for t in tags if t not in self._pc2_seen]
+        if not new:
+            return original
+        self._pc2_seen.update(new)
+        slots = min(self.operation_limit-1-self.operation_count,self.llm_counter.safe_limit-self.llm_counter.call_count)
+        if slots<=0:
+            return original
+        state = self.completed_state()
+        engine = RestrictedRollout(*state,SEARCH,slots,eligible=self.local_nodes)
+        pair = pc2_pair(engine,budget)
+        key = BudgetRollout.key(original[0])
+        other = next((a for a in pair if BudgetRollout.key(a)!=key),None)
+        event = dict(operation=self.operation_count,budget=budget,tags=new,
+            incumbent=key,replaced=False,allowed_pair=[BudgetRollout.key(a) for a in pair])
+        if other is None or key not in {BudgetRollout.key(a) for a in pair}:
+            event['reason']='no_second_original_prefix'
+            self.pc2_records.append(event)
+            return original
+        started = time.monotonic()
+        selected,evidence = pc2_compare(state,budget,slots,set(self.local_nodes),original[0],other,
+            self.pc2_seconds,self.pc2_depth,self.pc2_margin)
+        event.update(evidence,seconds=time.monotonic()-started,chosen=BudgetRollout.key(selected))
+        self.pc2_records.append(event)
+        return [selected]
+
+import types as _ip_types
+_ip_base = _ip_types.SimpleNamespace(**globals())
+_ip_policy = dict(__name__="_ip_policy", __file__=__file__)
+exec(compile('"""Prioritize every scout batch using finite-50 influence from public topology."""\ndef rank(node_count, known, dead, edges):\n    alive=set(range(1,node_count+1))-set(dead); known=set(known)\n    if not known<=alive: raise ValueError(\'Known dead node\')\n    neighbors={i:{i} for i in alive}; edge_set=set()\n    for a,b in edges:\n        if a==b or a not in alive or b not in alive or not ({a,b}&known): raise ValueError(\'Nonpublic edge\')\n        edge_set.add(tuple(sorted((a,b)))); neighbors[a].add(b); neighbors[b].add(a)\n    coefficients={i:1. for i in alive}\n    for _ in range(50):\n        nxt={i:0. for i in alive}\n        for u in sorted(alive):\n            contribution=coefficients[u]/len(neighbors[u])\n            for v in sorted(neighbors[u]): nxt[v]+=contribution\n        coefficients=nxt\n    unknown=alive-known; degree={i:len(neighbors[i])-1 for i in unknown}\n    priority=sorted(unknown,key=lambda i:(-round(coefficients[i],10),-degree[i],i))\n    return priority,coefficients\n\ndef model_class(base):\n    class InfluencePrefix(base.ParticipantSquadModel):\n        def _scan_priority(self):\n            if self.node_count!=50 or len(self.local_nodes)+len(self.dead_nodes)>=44:\n                return super()._scan_priority()\n            priority,coefficients=rank(self.node_count,self.local_nodes,self.dead_nodes,self.local_edges)\n            if not hasattr(self,\'influence_prefix_records\'): self.influence_prefix_records=[]\n            self.influence_prefix_records.append(dict(operation=self.operation_count,known=sorted(self.local_nodes),dead=sorted(self.dead_nodes),\n                edges=sorted(self.local_edges),priority=priority,coefficients=coefficients))\n            return priority\n    return InfluencePrefix\n', "<influence-prefix-policy>", "exec"), _ip_policy)
+ParticipantSquadModel = _ip_policy["model_class"](_ip_base)

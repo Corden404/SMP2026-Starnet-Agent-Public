@@ -1,0 +1,15 @@
+{
+  "variant": "IP44",
+  "archive_sha256": "1c705f78ca05fb1a60b90e691853349d2ba0109e92a5d24b88135f28245f5249",
+  "files": {
+    "config.json": "98f11ebdb2eaaac1d31f84b804b3f3d673442ca23c364f796270f59e1bca9b0d",
+    "prompt/budget_plan.txt": "99bac8bc8c9a83dcd39242212a7f90b3fe572a415abc6f48a2d78d4536f59280",
+    "prompt/commander_react.txt": "d786197ac868e88d4618fe17dbf4401cb0f08733f33a390cae289c639287dffe",
+    "prompt/executor_react.txt": "b846d44e6fcf4784929249cb4171cfd99025fecfc5a7c28d899b3226446a000f",
+    "prompt/reflect.txt": "46f35934277a727dc0e406e63c0ee364512377257a210bff31c38f4ff9e05581",
+    "prompt/scan_batch.txt": "f257ffa604e16eedde79abe608046edc3feb939c66a6f25f3d8259ac9b8005b7",
+    "prompt/score_action.txt": "86af2a70ed0b45e15d93b26e2293b33654efe6e52e7b90cb14adb5d69fa949d1",
+    "prompt/scout_react.txt": "f95e407c75fae3832bb41d7de9d68499d112c0cf57036e2a5ed8dd05fa261ca5",
+    "starnet_model.py": "5c38f3a10f87388d594ea615d89e99650493b97ea9059fc01f1395724ebea077"
+  }
+}

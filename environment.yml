@@ -1,6 +1,0 @@
-name: smp2026
-channels:
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
-dependencies:
-  - python=3.11
-  - pip

@@ -1,8 +1,8 @@
-# Dependencies used by the SMP 2026 starter kit and CaseVO 0.3.19.
-# Keep Mesa/Chroma on the framework-era versions to avoid API drift.
+# Runtime tested with Python 3.11 and CaseVO v0.3.19.
 chromadb==0.5.23
 mesa==2.4.0
-networkx>=3.2,<4
+networkx==3.6.1
+numpy==2.4.6
 requests>=2.31,<3
 sniffio>=1.3,<2
 zhipuai>=2.1,<3

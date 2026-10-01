@@ -1,0 +1,7 @@
+CaseVO v0.3.19
+Source: https://github.com/rgCASS/casevo
+License: Apache License 2.0 (see licenses/CaseVO-LICENSE.txt)
+Used as an external framework for offline testing. Not bundled in the submission ZIP.
+
+Additional runtime dependencies are listed in requirements.txt.
+Their license terms are provided by the corresponding distributions.

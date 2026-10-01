@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Preserve the frozen submission's original bytes on every platform.
+/workspace/team_submission/** -text -whitespace
